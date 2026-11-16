@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>D-Day 꽃잎</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #9cc7ee;
+    font-family: "Pretendard", "Apple SD Gothic Neo", "Noto Sans KR", "Segoe UI", system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #label { position: fixed; left: clamp(20px, 4vw, 56px); top: clamp(18px, 4vh, 48px); color: #fff;
+    text-shadow: 0 2px 22px rgba(20, 50, 90, .45); pointer-events: none; user-select: none; }
+  #label .d { font-size: clamp(46px, 8vw, 104px); font-weight: 200; letter-spacing: .02em; line-height: 1; }
+  #label .s { font-size: clamp(13px, 1.4vw, 17px); opacity: .92; margin-top: 10px; letter-spacing: .1em; }
+  #ui { position: fixed; left: 50%; bottom: clamp(16px, 4vh, 36px); transform: translateX(-50%);
+    display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; width: max-content; max-width: 94vw; }
+  button { appearance: none; border: 1px solid rgba(255, 255, 255, .55); color: #fff; cursor: pointer;
+    background: rgba(255, 255, 255, .16); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+    padding: 11px 20px; border-radius: 999px; font: inherit; font-size: 15px; letter-spacing: .04em;
+    text-shadow: 0 1px 8px rgba(20, 50, 30, .5); transition: background .2s, transform .1s; }
+  button:hover { background: rgba(255, 255, 255, .3); }
+  button:active { transform: scale(.96); }
+  button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  button.on { background: rgba(255, 255, 255, .42); }
+  button:disabled { opacity: .45; cursor: default; }
+  .hide { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="label"><div class="d" id="dtext">D-10</div><div class="s" id="stext">하루에 꽃잎 하나</div></div>
+<div id="ui">
+  <button id="next">하루 보내기</button>
+  <button id="auto">자동 재생</button>
+  <button id="reset">처음으로</button>
+</div>
+<script>
+(() => {
+  'use strict';
+  // ---------- 설정 (주소 파라미터) ----------
+  // ?days=10  남은 날   ?total=10  꽃잎 수   ?date=2026-12-25  실제 날짜 기준
+  // ?ui=0  버튼 숨김    ?label=0  글자 숨김 (배경 모드)
+  const qs = new URLSearchParams(location.search);
+  const num = (k, d, lo, hi) => { const v = parseInt(qs.get(k), 10); return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d; };
+  const TOTAL = num('total', 10, 3, 24);
+  const dateParam = qs.get('date');
+  const daysFromDate = () => {
+    const t = new Date(dateParam + 'T00:00:00'); if (isNaN(t)) return null;
+    const n = new Date(); n.setHours(0, 0, 0, 0);
+    return Math.max(0, Math.round((t - n) / 86400000));
+  };
+  let startDays = num('days', TOTAL, 0, 9999);
+  if (dateParam && daysFromDate() !== null) startDays = daysFromDate();
+  if (qs.get('ui') === '0') document.getElementById('ui').classList.add('hide');
+  if (qs.get('label') === '0') document.getElementById('label').classList.add('hide');
+
+  // ---------- 도구 ----------
+  const TAU = Math.PI * 2;
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
+  const ease = t => t * t * (3 - 2 * t);
+  function rng(seed) { let a = seed >>> 0; return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  function makeNoise(seed) { const r = rng(seed), g = Array.from({ length: 256 }, () => r());
+    return x => { const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f); return g[i & 255] + (g[(i + 1) & 255] - g[i & 255]) * u; }; }
+  function fbm(n, x, o) { let s = 0, a = .5, f = 1, t = 0; for (let k = 0; k < o; k++) { s += a * n(x * f); t += a; a *= .5; f *= 2.03; } return s / t; }
+
+  const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+  let W = 0, H = 0, DPR = 1, HOR = 0, R = 0, CX = 0, CY = 0;
+  let skyL, landL, clouds = [], cloudSprites = [], rows = [], bgFlowers = [], bokeh = [], motes = [], seeds = [], sprites = {};
+  function layer(w, h, scale) { const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(w * scale)); c.height = Math.max(1, Math.round(h * scale));
+    const x = c.getContext('2d'); x.scale(scale, scale); return { c, x }; }
+
+  // 바람: 0~1, 화면을 가로질러 흐르는 돌풍
+  function gust(x, t) {
+    const a = .5 + .5 * Math.sin(x * .0045 - t * 1.1 + 1.3 * Math.sin(t * .23));
+    return a * (.55 + .45 * Math.sin(t * .37 + x * .0011));
+  }
+
+  // ---------- 하늘 ----------
+  function buildSky() {
+    skyL = layer(W, H, DPR); const c = skyL.x;
+    const g = c.createLinearGradient(0, 0, 0, HOR + H * .02);
+    g.addColorStop(0, '#3c7bcf'); g.addColorStop(.42, '#7fb6ec'); g.addColorStop(.8, '#cfe7f9'); g.addColorStop(1, '#fff0da');
+    c.fillStyle = g; c.fillRect(0, 0, W, H);
+    const sx = W * .8, sy = H * .16, sr = Math.max(W, H) * .55;
+    const s = c.createRadialGradient(sx, sy, 0, sx, sy, sr);
+    s.addColorStop(0, 'rgba(255,250,232,.95)'); s.addColorStop(.035, 'rgba(255,244,214,.75)');
+    s.addColorStop(.16, 'rgba(255,236,196,.28)'); s.addColorStop(1, 'rgba(255,236,196,0)');
+    c.fillStyle = s; c.fillRect(0, 0, W, H);
+  }
+
+  // ---------- 구름 ----------
+  function blob(c, x, y, r, rgb, a) {
+    const g = c.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(.55, `rgba(${rgb},${a * .62})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    c.fillStyle = g; c.beginPath(); c.arc(x, y, r, 0, TAU); c.fill();
+  }
+  function makeCloud(seed) {
+    const r = rng(seed), cw = 640, ch = 320, L = layer(cw, ch, 1), c = L.x, puffs = [];
+    const n = 60 + (r() * 30 | 0);
+    for (let i = 0; i < n; i++) {
+      const t = r(), env = Math.pow(Math.sin(Math.PI * t), .8);
+      const rad = ch * (.05 + .17 * env * (.3 + r() * .8));
+      puffs.push({ x: cw * (.13 + .74 * t), y: ch * .7 - rad * (.25 + r() * 1.6 * env), r: rad });
+    }
+    for (const p of puffs) blob(c, p.x + p.r * .1, p.y + p.r * .38, p.r * 1.08, '168,184,212', .55);
+    for (const p of puffs) blob(c, p.x, p.y - p.r * .12, p.r, '255,255,255', .92);
+    c.globalCompositeOperation = 'source-atop';
+    const g = c.createLinearGradient(cw, 0, cw * .2, ch);
+    g.addColorStop(0, 'rgba(255,238,208,.6)'); g.addColorStop(.5, 'rgba(255,255,255,0)'); g.addColorStop(1, 'rgba(118,138,176,.3)');
+    c.fillStyle = g; c.fillRect(0, 0, cw, ch);
+    c.globalCompositeOperation = 'destination-out';
+    const m = c.createLinearGradient(0, ch * .68, 0, ch * .86);
+    m.addColorStop(0, 'rgba(0,0,0,0)'); m.addColorStop(1, 'rgba(0,0,0,1)');
+    c.fillStyle = m; c.fillRect(0, ch * .68, cw, ch * .32);
+    return L.c;
+  }
+  function buildClouds() {
+    if (!cloudSprites.length) for (let i = 0; i < 7; i++) cloudSprites.push(makeCloud(100 + i * 17));
+    const r = rng(5); clouds = [];
+    const add = (n, y0, y1, w0, w1, a, sp) => { for (let i = 0; i < n; i++) { const w = W * lerp(w0, w1, r());
+      clouds.push({ s: cloudSprites[r() * cloudSprites.length | 0], x: (i + r() * .8) / n * (W + w) - w, y: H * lerp(y0, y1, r()), w, h: w * .5, a, v: sp * (W / 1400) }); } };
+    const hy = HOR / H;
+    add(6, hy - .26, hy - .13, .13, .24, .78, 5);
+    add(4, .16, .34, .28, .44, .93, 10);
+    add(2, -.03, .1, .5, .72, .97, 17);
+  }
+  function drawClouds(dt) {
+    ctx.imageSmoothingQuality = 'high';
+    for (const c of clouds) {
+      c.x += c.v * dt; if (c.x > W + 40) c.x = -c.w - 40;
+      ctx.globalAlpha = c.a; ctx.drawImage(c.s, c.x, c.y, c.w, c.h);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- 먼 풍경과 들판 바탕 ----------
+  function buildLand() {
+    landL = layer(W, H, DPR); const c = landL.x, r = rng(21);
+    const ridge = (fn, col) => { c.beginPath(); c.moveTo(0, H); for (let x = 0; x <= W + 4; x += 4) c.lineTo(x, fn(x)); c.lineTo(W, H); c.closePath(); c.fillStyle = col; c.fill(); };
+    // 설산
+    const n1 = makeNoise(11), mtn = x => HOR - H * .015 - H * .34 * Math.pow(fbm(n1, x / W * 3.4 + 5, 5), 1.9);
+    let top = HOR; for (let x = 0; x <= W; x += 8) top = Math.min(top, mtn(x));
+    let g = c.createLinearGradient(0, top, 0, HOR);
+    g.addColorStop(0, '#ffffff'); g.addColorStop(.3, '#f3f6fb'); g.addColorStop(.5, '#9db4d6'); g.addColorStop(1, '#b3c8df');
+    ridge(mtn, g);
+    // 중간 언덕
+    const n2 = makeNoise(31);
+    g = c.createLinearGradient(0, HOR - H * .09, 0, HOR); g.addColorStop(0, '#7a9fae'); g.addColorStop(1, '#a9c6b8');
+    ridge(x => HOR - H * .008 - H * .1 * Math.pow(fbm(n2, x / W * 2.3 + 9, 4), 1.4), g);
+    // 숲 가장자리
+    const n3 = makeNoise(47);
+    g = c.createLinearGradient(0, HOR - H * .06, 0, HOR + 4); g.addColorStop(0, '#47774f'); g.addColorStop(1, '#739f68');
+    ridge(x => HOR - H * .008 - H * .05 * fbm(n3, x / W * 8, 4) - H * .007 * Math.abs(Math.sin(x * .11 + 6 * n3(x * .02))), g);
+    // 들판
+    const n4 = makeNoise(63);
+    g = c.createLinearGradient(0, HOR, 0, H);
+    g.addColorStop(0, '#c3d98f'); g.addColorStop(.18, '#9cc468'); g.addColorStop(.5, '#63a03f'); g.addColorStop(1, '#2f6a22');
+    ridge(x => HOR + H * .006 * (fbm(n4, x / W * 3, 3) - .5), g);
+    // 들판 결
+    const cnt = Math.round(W * H / 190);
+    c.lineCap = 'round';
+    for (let i = 0; i < cnt; i++) {
+      const d = Math.pow(r(), 1.9), y = HOR + 3 + d * (H - HOR), x = r() * W, len = 2 + d * 16;
+      c.strokeStyle = `hsla(${lerp(74, 106, d) + r() * 16 - 8},${40 + r() * 16}%,${lerp(58, 30, d) + r() * 12 - 6}%,.7)`;
+      c.lineWidth = .6 + d * 1.6; c.beginPath(); c.moveTo(x, y); c.lineTo(x + len * .35, y - len); c.stroke();
+    }
+    // 먼 들꽃
+    for (let i = 0; i < W * .5; i++) {
+      const d = Math.pow(r(), 2.2) * .6, y = HOR + 4 + d * (H - HOR), x = r() * W, s = .8 + d * 4.5, k = r();
+      c.fillStyle = k < .45 ? 'rgba(255,255,255,.85)' : k < .85 ? 'rgba(248,160,205,.85)' : 'rgba(255,224,120,.85)';
+      c.beginPath(); c.arc(x, y, s, 0, TAU); c.fill();
+    }
+    // 지평선 안개
+    g = c.createLinearGradient(0, HOR - H * .1, 0, HOR + H * .12);
+    g.addColorStop(0, 'rgba(255,244,226,0)'); g.addColorStop(.45, 'rgba(255,244,226,.5)'); g.addColorStop(1, 'rgba(255,244,226,0)');
+    c.fillStyle = g; c.fillRect(0, HOR - H * .1, W, H * .22);
+  }
+
+  // ---------- 잔디 ----------
+  function buildGrass() {
+    const r = rng(7), N = 18; rows = [];
+    const dens = W * H > 1.6e6 ? 1.15 : 1;
+    for (let k = 0; k < N; k++) {
+      const d = k / (N - 1), y = HOR + 2 + Math.pow(d, 1.7) * (H * 1.07 - HOR), sp = lerp(4, 15, d) * dens, list = [];
+      for (let i = 0, n = Math.ceil(W / sp) + 3; i < n; i++) {
+        const hue = lerp(78, 106, d) + r() * 14 - 7, sat = lerp(40, 54, d) + r() * 10;
+        list.push({ x: (i - 1 + r()) * sp, y: y + r() * 5, h: lerp(7, H * .21, Math.pow(d, 1.8)) * (.55 + r() * .9),
+          w: lerp(1, 8.5, Math.pow(d, 1.5)) * (.7 + r() * .6), pre: `hsl(${hue.toFixed(0)},${sat.toFixed(0)}%,`,
+          lit: lerp(54, 25, d) + r() * 10 - 5, ph: r() * TAU, st: .7 + r() * .6 });
+      }
+      rows.push({ y, d, list, front: y > H * .93 });
+    }
+  }
+  function drawRow(row, t) {
+    for (const b of row.list) {
+      const g = gust(b.x, t), bend = (.1 + .52 * g + .07 * Math.sin(t * 3.1 * b.st + b.ph)) * b.st;
+      const tx = b.x + b.h * Math.sin(bend) * .92, ty = b.y - b.h * Math.cos(bend * .8), mx = b.x + b.h * bend * .18, my = b.y - b.h * .55;
+      ctx.fillStyle = b.pre + (b.lit + g * 10).toFixed(0) + '%)';
+      ctx.beginPath(); ctx.moveTo(b.x - b.w / 2, b.y); ctx.quadraticCurveTo(mx - b.w * .35, my, tx, ty);
+      ctx.quadraticCurveTo(mx + b.w * .35, my, b.x + b.w / 2, b.y); ctx.fill();
+    }
+  }
+
+  // ---------- 배경 들꽃 (작게 그려 키워서 초점이 나간 느낌) ----------
+  function makeFlowerSprite(px, petal, mid, pad) {
+    const L = layer(px, px, 1), c = L.x; c.translate(px / 2, px / 2); const h = px / 2 * (pad || 1);
+    for (let i = 0; i < 8; i++) { c.rotate(TAU / 8); const g = c.createLinearGradient(0, 0, 0, -h * .95);
+      g.addColorStop(0, mid); g.addColorStop(1, petal); c.fillStyle = g; c.beginPath(); c.ellipse(0, -h * .55, h * .24, h * .42, 0, 0, TAU); c.fill(); }
+    c.fillStyle = '#f2b61c'; c.beginPath(); c.arc(0, 0, h * .2, 0, TAU); c.fill();
+    return L.c;
+  }
+  function buildFlowers() {
+    sprites.sharp = [makeFlowerSprite(72, '#ffd3e8', '#e5559c'), makeFlowerSprite(72, '#ffffff', '#f3d9e6'), makeFlowerSprite(72, '#f48fc0', '#b92670')];
+    sprites.soft = [makeFlowerSprite(30, '#ffc9e2', '#e860a4', .66), makeFlowerSprite(30, '#ffffff', '#f6e3ec', .66)];
+    const r = rng(77); bgFlowers = [];
+    for (let i = 0; i < Math.round(W / 34); i++) {
+      const k = 3 + (r() * (rows.length - 7) | 0), row = rows[k], x = r() * W;
+      if (Math.abs(x - CX) < R * 1.1 && row.d > .55) continue;
+      bgFlowers.push({ k, x, y: row.y, hgt: lerp(12, H * .2, Math.pow(row.d, 1.7)) * (.8 + r() * .5), s: lerp(5, R * .5, Math.pow(row.d, 1.6)) * (.75 + r() * .5),
+        spr: sprites.sharp[r() * 3 | 0], ph: r() * TAU, rot: r() * TAU });
+    }
+    bokeh = [
+      { x: W * .06, y: H * .86, s: R * 2.2, spr: sprites.soft[0], ph: 1.2 },
+      { x: W * .95, y: H * .78, s: R * 1.9, spr: sprites.soft[1], ph: 3.1 },
+      { x: W * .86, y: H * .97, s: R * 2.5, spr: sprites.soft[0], ph: 5.0 },
+    ];
+  }
+  function drawBgFlowers(k, t) {
+    for (const f of bgFlowers) {
+      if (f.k !== k) continue;
+      const g = gust(f.x, t), sw = f.hgt * (.1 + .32 * g + .03 * Math.sin(t * 2.2 + f.ph)), hx = f.x + sw, hy = f.y - f.hgt + sw * .15;
+      ctx.strokeStyle = '#5c9440'; ctx.lineWidth = Math.max(.8, f.s * .07);
+      ctx.beginPath(); ctx.moveTo(f.x, f.y); ctx.quadraticCurveTo(f.x + sw * .2, f.y - f.hgt * .6, hx, hy); ctx.stroke();
+      ctx.save(); ctx.translate(hx, hy); ctx.rotate(f.rot + sw / f.hgt * .6); ctx.scale(1, .8);
+      ctx.drawImage(f.spr, -f.s / 2, -f.s / 2, f.s, f.s); ctx.restore();
+    }
+  }
+
+  // ---------- 주인공 꽃 ----------
+  const petals = [], flying = [], sparks = [];
+  (function initPetals() {
+    const r = rng(1234);
+    for (let i = 0; i < TOTAL; i++) petals.push({ a: i / TOTAL * TAU + (r() - .5) * .07, len: .95 + r() * .09, wid: .96 + r() * .08,
+      dh: r() * 10 - 5, ph: r() * TAU, state: 'off', t: 0 });
+  })();
+  let days = 0;
+
+  function petalPath(c, y0, S, w) {
+    const Y = f => y0 - S * f;
+    c.beginPath(); c.moveTo(0, y0);
+    c.bezierCurveTo(-w * .1, Y(.25), -w * .56, Y(.55), -w * .48, Y(.86));
+    c.quadraticCurveTo(-w * .46, Y(.97), -w * .3, Y(.985));
+    c.quadraticCurveTo(-w * .2, Y(.99), -w * .16, Y(.945));
+    c.quadraticCurveTo(-w * .1, Y(1.005), 0, Y(1.005));
+    c.quadraticCurveTo(w * .1, Y(1.005), w * .16, Y(.945));
+    c.quadraticCurveTo(w * .2, Y(.99), w * .3, Y(.985));
+    c.quadraticCurveTo(w * .46, Y(.97), w * .48, Y(.86));
+    c.bezierCurveTo(w * .56, Y(.55), w * .1, Y(.25), 0, y0);
+    c.closePath();
+  }
+  // 원점은 꽃 중심, 꽃잎은 위(-y)로 뻗는다
+  function drawPetal(c, p, shade) {
+    const r0 = R * .17, y0 = -r0 * .7, S = (R * p.len) - r0 * .7, w = Math.min(.78, 2 * Math.sin(Math.PI / TOTAL) * .84) * R * p.wid;
+    c.save();
+    c.shadowColor = `rgba(90,10,50,${shade})`; c.shadowBlur = R * .07; c.shadowOffsetY = R * .02;
+    const g = c.createLinearGradient(0, y0, 0, y0 - S);
+    g.addColorStop(0, `hsl(${322 + p.dh},72%,37%)`); g.addColorStop(.17, `hsl(${326 + p.dh},78%,55%)`);
+    g.addColorStop(.55, `hsl(${329 + p.dh},86%,69%)`); g.addColorStop(1, `hsl(${332 + p.dh},92%,84%)`);
+    petalPath(c, y0, S, w); c.fillStyle = g; c.fill();
+    c.shadowColor = 'transparent'; c.clip();
+    const s = c.createLinearGradient(-w / 2, 0, w / 2, 0);
+    s.addColorStop(0, 'rgba(255,255,255,.26)'); s.addColorStop(.45, 'rgba(255,255,255,0)'); s.addColorStop(1, 'rgba(110,0,60,.16)');
+    c.fillStyle = s; c.fillRect(-w, y0 - S * 1.05, w * 2, S * 1.1);
+    c.lineWidth = Math.max(.6, R * .004); c.lineCap = 'round';
+    for (let k = -3; k <= 3; k++) { const xe = k / 3 * w * .4;
+      c.strokeStyle = k === 0 ? 'rgba(140,15,80,.3)' : 'rgba(140,15,80,.19)';
+      c.beginPath(); c.moveTo(0, y0 - S * .04); c.quadraticCurveTo(xe * .78, y0 - S * .5, xe, y0 - S * .93); c.stroke(); }
+    c.restore();
+  }
+  function headPose(t) {
+    const g = gust(CX, t), sway = (g - .35) * R * .32 + Math.sin(t * 1.3) * R * .03;
+    return { x: CX + sway, y: CY + Math.abs(sway) * .12 + Math.sin(t * .9) * R * .012, rot: sway / R * .35, sway, g };
+  }
+  const bez = (p, t) => { const u = 1 - t; return { x: u*u*u*p[0] + 3*u*u*t*p[2] + 3*u*t*t*p[4] + t*t*t*p[6], y: u*u*u*p[1] + 3*u*u*t*p[3] + 3*u*t*t*p[5] + t*t*t*p[7] }; };
+  const bezT = (p, t) => { const u = 1 - t; return Math.atan2(3*u*u*(p[3]-p[1]) + 6*u*t*(p[5]-p[3]) + 3*t*t*(p[7]-p[5]), 3*u*u*(p[2]-p[0]) + 6*u*t*(p[4]-p[2]) + 3*t*t*(p[6]-p[4])); };
+  function drawStem(hp, t) {
+    const P = [CX - R * .35, H + 12, CX - R * .52, H * .84, hp.x - R * .16 - hp.sway * .3, hp.y + R * 1.5, hp.x, hp.y];
+    // 실 같은 잎
+    ctx.lineCap = 'round';
+    [[.3, 1], [.42, -1], [.56, 1], [.68, -1]].forEach(([u, side], i) => {
+      const o = bez(P, u), ang = bezT(P, u) + side * (.95 - hp.g * .25 * side) , L = R * (.95 - i * .12);
+      const rib = k => ({ x: o.x + Math.cos(ang) * L * k + Math.cos(ang - side * 1.2) * L * .18 * k * k, y: o.y + Math.sin(ang) * L * k + Math.sin(ang - side * 1.2) * L * .18 * k * k });
+      ctx.strokeStyle = '#4f8b3a'; ctx.lineWidth = Math.max(1, R * .014);
+      ctx.beginPath(); ctx.moveTo(o.x, o.y); for (let k = .1; k <= 1.001; k += .1) { const q = rib(k); ctx.lineTo(q.x, q.y); } ctx.stroke();
+      ctx.lineWidth = Math.max(.8, R * .009);
+      for (let j = 1; j <= 5; j++) { const k = j / 6, q = rib(k), l = L * .34 * (1 - k * .5);
+        for (const sgn of [-1, 1]) { const a = ang + sgn * .62 + Math.sin(t * 2 + j + i) * .05;
+          ctx.beginPath(); ctx.moveTo(q.x, q.y); ctx.quadraticCurveTo(q.x + Math.cos(a) * l * .6, q.y + Math.sin(a) * l * .6, q.x + Math.cos(a - sgn * .25) * l, q.y + Math.sin(a - sgn * .25) * l); ctx.stroke(); } }
+    });
+    const path = () => { ctx.beginPath(); ctx.moveTo(P[0], P[1]); ctx.bezierCurveTo(P[2], P[3], P[4], P[5], P[6], P[7]); };
+    ctx.strokeStyle = '#356e2b'; ctx.lineWidth = R * .062; path(); ctx.stroke();
+    ctx.save(); ctx.translate(-R * .012, 0); ctx.strokeStyle = '#7db458'; ctx.lineWidth = R * .02; path(); ctx.stroke(); ctx.restore();
+  }
+  function drawHead(hp, t, dt) {
+    const r0 = R * .17;
+    ctx.save(); ctx.translate(hp.x, hp.y); ctx.rotate(hp.rot); ctx.scale(1, .93);
+    // 꽃받침
+    for (let i = 0; i < 8; i++) { ctx.save(); ctx.rotate(i / 8 * TAU + .2);
+      ctx.fillStyle = i % 2 ? '#4a8737' : '#5c9a44'; ctx.beginPath(); ctx.moveTo(-r0 * .32, 0);
+      ctx.quadraticCurveTo(-r0 * .3, -r0 * 1.3, 0, -r0 * 2.05); ctx.quadraticCurveTo(r0 * .3, -r0 * 1.3, r0 * .32, 0); ctx.fill(); ctx.restore(); }
+    // 꽃잎
+    for (const p of petals) {
+      if (p.state === 'off') continue;
+      let sc = 1, extra = 0;
+      if (p.state === 'grow') { p.t += dt; if (p.t < 0) continue; sc = ease(clamp01(p.t / .9)); if (p.t >= .9) p.state = 'on'; }
+      if (p.state === 'loose') { p.t += dt; if (p.t > 0) extra = .22 * (p.t / .75) * Math.sin(t * 19 + p.ph); if (p.t >= .75) { release(p, hp); continue; } }
+      ctx.save();
+      ctx.rotate(p.a + .05 * hp.g * Math.sin(t * 5 + p.ph) + .03 * Math.sin(t * 1.7 + p.ph) + extra);
+      ctx.scale(sc, sc * (.95 + .05 * Math.sin(t * 2.3 + p.ph)));
+      drawPetal(ctx, p, .36); ctx.restore();
+    }
+    // 꽃술
+    ctx.save(); ctx.shadowColor = 'rgba(70,20,10,.45)'; ctx.shadowBlur = R * .05; ctx.shadowOffsetY = R * .012;
+    const g = ctx.createRadialGradient(-r0 * .25, -r0 * .25, 0, 0, 0, r0);
+    g.addColorStop(0, '#fff2ac'); g.addColorStop(.5, '#f6c22e'); g.addColorStop(.86, '#d38412'); g.addColorStop(1, '#8a4a0c');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, r0, 0, TAU); ctx.fill(); ctx.restore();
+    const n = 96;
+    for (let i = 0; i < n; i++) { const f = i / n, rr = r0 * .9 * Math.sqrt(f), a = i * 2.39996, x = Math.cos(a) * rr, y = Math.sin(a) * rr, s = r0 * .05 * (.75 + f * .6);
+      ctx.fillStyle = f > .62 ? '#9c5210' : '#d99a1c'; ctx.beginPath(); ctx.arc(x, y, s, 0, TAU); ctx.fill();
+      ctx.fillStyle = f > .62 ? '#f7cf58' : '#fff0a0'; ctx.beginPath(); ctx.arc(x - s * .3, y - s * .3, s * .5, 0, TAU); ctx.fill(); }
+    ctx.restore();
+  }
+  function release(p, hp) {
+    p.state = 'off';
+    const r0 = R * .17, mid = (r0 * .7 + R * p.len) / 2;
+    let x = Math.sin(p.a) * mid, y = -Math.cos(p.a) * mid * .93;
+    const c = Math.cos(hp.rot), s = Math.sin(hp.rot);
+    flying.push({ p, x: hp.x + x * c - y * s, y: hp.y + x * s + y * c, rot: p.a + hp.rot, vx: Math.sin(p.a) * 40 + 30, vy: -Math.cos(p.a) * 40 - 20,
+      spin: (Math.random() - .5) * 3, flip: Math.random() * TAU, fs: 2.6 + Math.random() * 2.4, landY: H * (.86 + Math.random() * .1), landed: false, a: 1, age: 0, mid });
+  }
+  function drawFlying(t, dt, landedPass) {
+    const k = H / 800;
+    for (let i = flying.length - 1; i >= 0; i--) {
+      const f = flying[i];
+      if (f.landed !== landedPass) continue;
+      if (!f.landed) {
+        f.age += dt; const g = gust(f.x, t), wind = W * .11 * (.5 + g);
+        f.vx += (wind - f.vx) * .9 * dt + Math.cos(f.flip) * 26 * k * dt;
+        f.vy += (64 * k - f.vy * .9) * dt + Math.sin(f.flip * 1.3) * 70 * k * dt;
+        f.x += f.vx * dt; f.y += f.vy * dt; f.rot += (f.spin + Math.sin(f.flip) * 1.2) * dt; f.flip += f.fs * dt;
+        if (f.y >= f.landY) { f.landed = true; f.age = 0; }
+        if (f.x > W + R * 1.5 || f.y > H + R) { flying.splice(i, 1); continue; }
+      } else { f.age += dt; if (f.age > 40) { f.a -= dt * .2; if (f.a <= 0) { flying.splice(i, 1); continue; } } }
+      ctx.save(); ctx.globalAlpha = f.a; ctx.translate(f.x, f.y);
+      if (f.landed) { ctx.scale(1, .34); ctx.rotate(f.rot); }
+      else { ctx.rotate(f.rot); ctx.scale(.22 + .78 * Math.abs(Math.cos(f.flip)), 1); }
+      ctx.translate(0, f.mid); drawPetal(ctx, f.p, f.landed ? .12 : .2); ctx.restore();
+    }
+  }
+
+  // ---------- 입자 ----------
+  function buildParticles() {
+    const r = rng(99); motes = []; seeds = [];
+    for (let i = 0; i < Math.round(W / 16); i++) motes.push({ x: r() * W, y: r() * H, r: .7 + Math.pow(r(), 2) * 2.6, z: .3 + r() * .9, ph: r() * TAU, sp: .6 + r() * 1.6, a: .25 + r() * .6 });
+    for (let i = 0; i < 9; i++) seeds.push({ x: r() * W, y: H * (.15 + r() * .7), z: .5 + r() * .8, ph: r() * TAU, s: 5 + r() * 7 });
+  }
+  function drawParticles(t, dt) {
+    ctx.save(); ctx.globalCompositeOperation = 'lighter';
+    for (const m of motes) {
+      const g = gust(m.x, t);
+      m.x += (26 + 80 * g) * m.z * dt * (W / 1200); m.y += (Math.sin(t * m.sp + m.ph) * 12 - 4) * dt;
+      if (m.x > W + 10) { m.x = -10; m.y = Math.random() * H; } if (m.y < -10) m.y = H + 10;
+      const a = m.a * (.55 + .45 * Math.sin(t * m.sp * 2.1 + m.ph));
+      ctx.fillStyle = `rgba(255,240,200,${a * .1})`; ctx.beginPath(); ctx.arc(m.x, m.y, m.r * 2.4, 0, TAU); ctx.fill();
+      ctx.fillStyle = `rgba(255,248,224,${a})`; ctx.beginPath(); ctx.arc(m.x, m.y, m.r, 0, TAU); ctx.fill();
+    }
+    for (let i = sparks.length - 1; i >= 0; i--) { const s = sparks[i]; s.life -= dt; if (s.life <= 0) { sparks.splice(i, 1); continue; }
+      s.x += s.vx * dt; s.y += s.vy * dt; s.vy -= 8 * dt; s.vx += 30 * dt;
+      ctx.fillStyle = `rgba(255,236,170,${clamp01(s.life) * .9})`; ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, TAU); ctx.fill(); }
+    ctx.restore();
+    // 홀씨
+    ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineCap = 'round';
+    for (const s of seeds) {
+      const g = gust(s.x, t);
+      s.x += (22 + 70 * g) * s.z * dt * (W / 1200); s.y += Math.sin(t * .7 + s.ph) * 9 * dt - 2 * dt;
+      if (s.x > W + 20) { s.x = -20; s.y = H * (.15 + Math.random() * .7); }
+      ctx.save(); ctx.translate(s.x, s.y); ctx.rotate(.35 + g * .5 + Math.sin(t + s.ph) * .2); ctx.lineWidth = .7;
+      ctx.beginPath(); ctx.moveTo(0, s.s); ctx.lineTo(0, 0);
+      for (let k = 0; k < 9; k++) { const a = -Math.PI / 2 + (k - 4) * .36; ctx.moveTo(0, 0); ctx.lineTo(Math.cos(a) * s.s * .8, Math.sin(a) * s.s * .8); }
+      ctx.stroke(); ctx.fillStyle = 'rgba(150,110,70,.8)'; ctx.beginPath(); ctx.ellipse(0, s.s, .9, 1.8, 0, 0, TAU); ctx.fill(); ctx.restore();
+    }
+  }
+  function drawLight() {
+    const sx = W * .8, sy = H * .16;
+    ctx.save(); ctx.globalCompositeOperation = 'lighter';
+    let g = ctx.createRadialGradient(sx, sy, 0, sx, sy, Math.max(W, H) * .9);
+    g.addColorStop(0, 'rgba(255,226,170,.2)'); g.addColorStop(1, 'rgba(255,226,170,0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H); ctx.restore();
+    g = ctx.createRadialGradient(W / 2, H * .48, Math.min(W, H) * .35, W / 2, H * .5, Math.max(W, H) * .78);
+    g.addColorStop(0, 'rgba(10,30,20,0)'); g.addColorStop(1, 'rgba(10,30,20,.34)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+
+  // ---------- 상태 ----------
+  const dtext = document.getElementById('dtext'), bNext = document.getElementById('next'), bAuto = document.getElementById('auto'), bReset = document.getElementById('reset');
+  function setDays(n, instant) {
+    n = Math.max(0, Math.round(n)); const was = days; days = n;
+    const want = Math.min(n, TOTAL), on = petals.filter(p => p.state === 'on' || p.state === 'grow');
+    const shuffle = a => { for (let i = a.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [a[i], a[j]] = [a[j], a[i]]; } return a; };
+    if (on.length > want) shuffle(on).slice(0, on.length - want).forEach((p, i) => { p.state = 'loose'; p.t = -i * .4; });
+    else if (on.length < want) shuffle(petals.filter(p => p.state === 'off')).slice(0, want - on.length).forEach((p, i) => { p.state = instant ? 'on' : 'grow'; p.t = -i * .1; });
+    dtext.textContent = n === 0 ? 'D-DAY' : 'D-' + n;
+    bNext.disabled = n === 0;
+    if (n === 0 && was > 0) setTimeout(() => { const hp = headPose(performance.now() / 1000);
+      for (let i = 0; i < 46; i++) { const a = Math.random() * TAU, v = 20 + Math.random() * 90;
+        sparks.push({ x: hp.x, y: hp.y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, r: 1 + Math.random() * 2.2, life: 1.2 + Math.random() * 1.6 }); } }, 900);
+  }
+  let autoId = 0;
+  function stopAuto() { clearInterval(autoId); autoId = 0; bAuto.classList.remove('on'); bAuto.textContent = '자동 재생'; }
+  bNext.onclick = () => { if (days > 0) setDays(days - 1); };
+  bReset.onclick = () => { stopAuto(); setDays(startDays); };
+  bAuto.onclick = () => { if (autoId) return stopAuto(); if (days === 0) setDays(startDays);
+    bAuto.classList.add('on'); bAuto.textContent = '멈춤';
+    autoId = setInterval(() => { if (days > 0) setDays(days - 1); if (days === 0) stopAuto(); }, 2600); };
+  addEventListener('keydown', e => {
+    if (e.target.tagName === 'BUTTON' && (e.key === ' ' || e.key === 'Enter')) return;
+    if (e.key === ' ' || e.key === 'ArrowRight') { e.preventDefault(); bNext.onclick(); }
+    else if (e.key === 'r' || e.key === 'R') bReset.onclick();
+    else if (e.key === 'h' || e.key === 'H') document.getElementById('ui').classList.toggle('hide');
+  });
+  // 다른 화면에서 값 넣기: postMessage({ days: 7 })
+  addEventListener('message', e => { if (e.data && typeof e.data.days === 'number') setDays(e.data.days); });
+  if (dateParam) setInterval(() => { const d = daysFromDate(); if (d !== null && d !== days) { startDays = d; setDays(d); } }, 30000);
+
+  // ---------- 배치와 루프 ----------
+  function resize() {
+    DPR = Math.min(2, devicePixelRatio || 1); W = innerWidth; H = innerHeight;
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    HOR = H * .6; R = Math.min(W * .3, H * .25); CX = W * .5; CY = H * .43;
+    buildSky(); buildClouds(); buildLand(); buildGrass(); buildFlowers(); buildParticles();
+    for (const f of flying) if (f.landed) f.landY = f.y = Math.min(f.y, H * .96);
+  }
+  let rz = 0; addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(resize, 120); });
+  resize(); setDays(startDays, true);
+
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(.05, (now - last) / 1000), t = now / 1000; last = now;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.drawImage(skyL.c, 0, 0, W, H);
+    drawClouds(dt);
+    ctx.drawImage(landL.c, 0, 0, W, H);
+    for (let k = 0; k < rows.length; k++) { if (rows[k].front) continue; drawBgFlowers(k, t); drawRow(rows[k], t); }
+    drawFlying(t, dt, true);
+    const hp = headPose(t);
+    drawStem(hp, t);
+    for (const row of rows) if (row.front) drawRow(row, t);
+    drawHead(hp, t, dt);
+    drawFlying(t, dt, false);
+    for (const b of bokeh) { const sw = (gust(b.x, t) - .3) * b.s * .16; ctx.globalAlpha = .9;
+      ctx.drawImage(b.spr, b.x - b.s / 2 + sw, b.y - b.s / 2 + Math.sin(t * .8 + b.ph) * 4, b.s, b.s); }
+    ctx.globalAlpha = 1;
+    drawParticles(t, dt);
+    drawLight();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
